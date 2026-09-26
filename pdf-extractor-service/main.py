@@ -64,8 +64,8 @@ def extract_units_and_topics(text: str) -> List[Dict[str, Any]]:
     
     return units
 
-@app.get("/")
-@app.get("/health")
+@app.api_route("/", methods=["GET", "HEAD"])
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health_check():
     return {
         "status": "online",
@@ -94,7 +94,6 @@ async def extract_document(
     raw_full_text = ""
 
     try:
-        # 1. PDF Extraction via pdfplumber with pypdf fallback
         if ext == "pdf":
             try:
                 with pdfplumber.open(io.BytesIO(contents)) as pdf:
@@ -177,3 +176,10 @@ async def extract_document(
             status_code=500,
             detail=f"Failed to parse document: {str(e)}"
         )
+
+if __name__ == "__main__":
+    import os
+    import uvicorn
+    # Render assigns the PORT env var (defaults to 10000)
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
