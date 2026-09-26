@@ -22,8 +22,7 @@ function ensureEnvLoaded() {
 ensureEnvLoaded()
 
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions'
-const DEFAULT_MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-120b'
-
+const DEFAULT_MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-20b'
 
 const NVIDIA_URL = 'https://integrate.api.nvidia.com/v1/chat/completions'
 const NVIDIA_MODEL = process.env.NVIDIA_MODEL || 'meta/llama-3.2-11b-vision-instruct'
@@ -37,27 +36,26 @@ interface GroqChatResponse {
   choices?: Array<{
     message?: {
       content?: string
+      reasoning?: string
     }
   }>
 }
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
-
 export function groqKeys(): string[] {
   ensureEnvLoaded()
   return Object.entries(process.env)
-    .filter(([k, v]) => /^GROQ_API_KEY\d*$/.test(k) && Boolean(v))
+    .filter(([k, v]) => /^GROQ_API_KEY.*$/i.test(k) && Boolean(v))
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([, v]) => v as string)
     .filter((k, i, arr) => arr.indexOf(k) === i)
 }
 
-// Each model has its OWN daily token pool, so when one is capped we switch models.
+// Order models by high TPM limits and fast JSON output
 function modelChain(primary: string): string[] {
-  return [primary, 'openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'qwen/qwen3.8-27b'].filter((m, i, a) => Boolean(m) && a.indexOf(m) === i)
+  return [primary, 'openai/gpt-oss-20b', 'qwen/qwen3.8-27b', 'openai/gpt-oss-120b'].filter((m, i, a) => Boolean(m) && a.indexOf(m) === i)
 }
-
 
 async function tryGroq(
   messages: ChatMessage[],
@@ -69,7 +67,7 @@ async function tryGroq(
 
   for (let round = 0; round < 3; round++) {
     for (const model of models) {
-      const maxTokens = model.startsWith('qwen') ? Math.min(options.maxTokens, 950) : Math.min(options.maxTokens, 2000)
+      const maxTokens = Math.min(options.maxTokens || 4000, 4096)
       for (const key of keys) {
         try {
           const response = await axios.post<GroqChatResponse>(
@@ -87,7 +85,7 @@ async function tryGroq(
         }
       }
     }
-    await sleep(1800 * (round + 1))
+    await sleep(1200 * (round + 1))
   }
   return null // all Groq attempts rate-limited
 }
@@ -101,7 +99,7 @@ async function tryNvidia(
   try {
     const response = await axios.post<GroqChatResponse>(
       NVIDIA_URL,
-      { model: NVIDIA_MODEL, messages, max_tokens: options.maxTokens, temperature: options.temperature, top_p: 0.95, stream: false },
+      { model: NVIDIA_MODEL, messages, max_tokens: Math.min(options.maxTokens, 2048), temperature: options.temperature, top_p: 0.95, stream: false },
       { headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', Accept: 'application/json' } }
     )
     return response.data.choices?.[0]?.message?.content?.trim() || ''
@@ -184,25 +182,41 @@ export function getLanguageInstruction(langCode?: string | null): string {
 
 function extractJson<T = any>(content: string): T {
   let clean = content.trim()
-  clean = clean.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '')
+  
+  // Remove markdown code fences if wrapped entirely
+  clean = clean.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim()
+
+  // Find object bounds
   const firstBrace = clean.indexOf('{')
-  if (firstBrace === -1) {
-    const firstBracket = clean.indexOf('[')
-    if (firstBracket !== -1) {
-      clean = clean.slice(firstBracket)
+  const lastBrace = clean.lastIndexOf('}')
+  
+  // Find array bounds
+  const firstBracket = clean.indexOf('[')
+  const lastBracket = clean.lastIndexOf(']')
+
+  let target = clean
+  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+    if (firstBracket === -1 || firstBrace <= firstBracket) {
+      target = clean.slice(firstBrace, lastBrace + 1)
+    } else if (lastBracket !== -1 && lastBracket > firstBracket) {
+      target = clean.slice(firstBracket, lastBracket + 1)
     }
-  } else {
-    clean = clean.slice(firstBrace)
+  } else if (firstBracket !== -1 && lastBracket !== -1 && lastBracket > firstBracket) {
+    target = clean.slice(firstBracket, lastBracket + 1)
+  } else if (firstBrace !== -1) {
+    target = clean.slice(firstBrace)
+  } else if (firstBracket !== -1) {
+    target = clean.slice(firstBracket)
   }
 
   // 1. Direct parse attempt
   try {
-    return JSON.parse(clean)
+    return JSON.parse(target)
   } catch {}
 
   // 2. Trailing comma cleanup
   try {
-    const relaxed = clean.replace(/,\s*([}\]])/g, '$1')
+    const relaxed = target.replace(/,\s*([}\]])/g, '$1')
     return JSON.parse(relaxed)
   } catch {}
 
@@ -212,8 +226,8 @@ function extractJson<T = any>(content: string): T {
   const stack: string[] = []
   let lastSafeIndex = 0
 
-  for (let i = 0; i < clean.length; i++) {
-    const char = clean[i]
+  for (let i = 0; i < target.length; i++) {
+    const char = target[i]
     if (escaped) {
       escaped = false
       continue
@@ -240,7 +254,7 @@ function extractJson<T = any>(content: string): T {
   }
 
   if (lastSafeIndex > 0) {
-    let candidate = clean.slice(0, lastSafeIndex).trim()
+    let candidate = target.slice(0, lastSafeIndex).trim()
     if (candidate.endsWith(',')) candidate = candidate.slice(0, -1).trim()
     
     const s: string[] = []
@@ -261,7 +275,8 @@ function extractJson<T = any>(content: string): T {
       candidate += open === '{' ? '}' : ']'
     }
     try {
-      return JSON.parse(candidate)
+      const relaxedCandidate = candidate.replace(/,\s*([}\]])/g, '$1')
+      return JSON.parse(relaxedCandidate)
     } catch {}
   }
 
@@ -361,6 +376,95 @@ Generate exactly 4-6 milestones and 3-5 resources. The "days" array must cover t
   const draft = normalizeDraft(parseRoadmapJson(content), durationDays)
 
  
+  if (durationDays && (draft.days?.length ?? 0) < durationDays) {
+    draft.days = await fillMissingDays(draft, durationDays, { apiKey, model, language })
+  }
+
+  return draft
+}
+
+export async function generateRoadmapFromCurriculum(
+  curriculumText: string,
+  learningStyle?: string,
+  options: RoadmapOptions = {}
+): Promise<RoadmapDraft> {
+  const { skillLevel, apiKey, model, language } = options
+  const durationDays = clampDuration(options.durationDays)
+  const langInstruction = getLanguageInstruction(language)
+
+  const durationLine = durationDays
+    ? `Target duration requested by user: ${durationDays} days. Distribute the curriculum topics into exactly ${durationDays} daily progression units (day 1 through ${durationDays}) and set "durationDays" to ${durationDays}.`
+    : `Infer an optimal curriculum duration (between ${MIN_DURATION_DAYS} and ${MAX_DURATION_DAYS} days) based on the syllabus volume and depth. Set "durationDays" to this number and generate a day entry for every day.`
+
+  const prompt = `You are an elite academic curriculum architect and learning coach.
+You have been provided with an uploaded curriculum / syllabus document.
+
+Deeply analyze this curriculum, extracting all core units, chapters, learning outcomes, and topic sequences, and transform it into an actionable day-by-day learning roadmap.
+
+UPLOADED CURRICULUM TEXT:
+"""
+${curriculumText.slice(0, 14000)}
+"""
+
+${learningStyle ? `Learner style: ${learningStyle}` : ''}
+${skillLevel ? `Target skill level: ${skillLevel}` : ''}
+${langInstruction ? `${langInstruction}` : ''}
+${durationLine}
+
+INSTRUCTIONS:
+1. "title": Extract or infer a crisp, professional course/goal title directly from the curriculum.
+2. "description": 2-3 sentence summary of the curriculum scope and target learning outcomes.
+3. "category": Choose the best matching category (Programming, Data Science, Design, Language, Business, Mathematics, Science, Arts, Health, Other).
+4. "milestones": Map the syllabus's main Units / Modules / Chapters into 4-8 ordered milestones with detailed descriptions.
+5. "resources": Extract any referenced textbooks, reference guides, websites, or tools mentioned in the syllabus.
+6. "days": Sequence every subtopic logically day by day. Every single day must have a focused title matching the curriculum, a 1-sentence focus description, and a type ("lesson", "practice", "review", or "project").
+7. "advice": Personalized coaching advice on how to study and master this specific syllabus.
+
+Respond ONLY with a valid JSON object in the exact format:
+{
+  "title": "Curriculum / Course Title",
+  "description": "Comprehensive outcome description",
+  "category": "Programming|Data Science|Design|Language|Business|Mathematics|Science|Arts|Health|Other",
+  "targetDate": null,
+  "durationDays": ${durationDays ?? 'an optimal integer between 7 and 90'},
+  "skillLevel": ${skillLevel ? `"${skillLevel}"` : '"beginner|intermediate|advanced"'},
+  "milestones": [
+    {
+      "title": "Unit 1: Module Title",
+      "description": "Scope of unit",
+      "dueDate": null,
+      "order": 1
+    }
+  ],
+  "resources": [
+    {
+      "title": "Textbook / Reference Name",
+      "url": null,
+      "type": "book|course|video|article|tool|practice"
+    }
+  ],
+  "days": [
+    {
+      "day": 1,
+      "week": 1,
+      "phase": "Unit 1",
+      "title": "Concrete curriculum subtopic",
+      "description": "1 sentence focus",
+      "type": "lesson|practice|review|project"
+    }
+  ],
+  "advice": "Personalized coaching strategy for this curriculum"
+}`
+
+  const content = await createChatCompletion([{ role: 'user', content: prompt }], {
+    temperature: 0.5,
+    maxTokens: 3000,
+    apiKey,
+    model,
+  })
+
+  const draft = normalizeDraft(parseRoadmapJson(content), durationDays)
+
   if (durationDays && (draft.days?.length ?? 0) < durationDays) {
     draft.days = await fillMissingDays(draft, durationDays, { apiKey, model, language })
   }
@@ -764,6 +868,91 @@ Be specific, warm, and action-oriented. No fluff.`
 
   return content || 'Keep going, you\'re making great progress!'
 }
+
+export interface VideoCandidateInfo {
+  id: number
+  videoId: string
+  title: string
+  durationSec?: number
+  views?: number
+  channel?: string
+}
+
+export async function verifyAndSelectBestVideo(
+  goalTitle: string,
+  category: string,
+  topic: string,
+  description: string,
+  candidates: VideoCandidateInfo[],
+  language?: string
+): Promise<{ selectedIndex: number; reason: string } | null> {
+  if (!candidates || candidates.length === 0) return null
+
+  const langObj = getLanguage(language)
+  const candidateListStr = candidates.map(c => {
+    const dur = c.durationSec && c.durationSec > 0 ? `${Math.floor(c.durationSec / 60)}m` : 'unknown duration'
+    const v = c.views && c.views > 0 ? `${c.views.toLocaleString()} views` : 'views unlisted'
+    return `[ID: ${c.id}] Title: "${c.title}" | Channel: "${c.channel || 'Unknown'}" | Duration: ${dur} | Views: ${v}`
+  }).join('\n')
+
+  const prompt = `You are an expert AI educational content verifier and curator.
+Your task is to review, compare, and select the single BEST YouTube video for a student's daily lesson.
+
+Student Learning Context:
+- Main Subject/Goal: "${goalTitle}"
+- Category: "${category || 'General'}"
+- Today's Lesson Topic: "${topic}"
+- Lesson Scope / Focus: "${description}"
+- Learner's Language: "${langObj.name}" (${langObj.nativeName})
+
+Found Candidate Videos from YouTube:
+${candidateListStr}
+
+CRITICAL RULES FOR COMPARISON & DISAMBIGUATION:
+1. STRICT DOMAIN & RELEVANCE VERIFICATION:
+   - Ensure the video belongs to the exact subject domain of "${goalTitle}" (${category}).
+   - DISAMBIGUATION EXAMPLE: If the goal is "Cloud Computing", you MUST REJECT videos about meteorological weather clouds, rainfall, UPSC/IAS geography lectures, or climate science. Only accept Cloud Computing / AWS / Azure / GCP / Server architecture tutorials.
+   - If the goal is "Python Programming", you MUST REJECT videos about biological snakes or reptiles.
+   - If the candidate is off-topic, spam, clickbait, or a different subject entirely, DO NOT SELECT IT.
+2. PEDAGOGICAL QUALITY:
+   - Prefer comprehensive, clear tutorials with genuine educational value over 30-second shorts or unrelated exam coaching.
+3. LANGUAGE PREFERENCE:
+   - If learner's language is "${langObj.name}" (and not English), prioritize high-quality tutorials in "${langObj.name}" or bilingual tech channels. If none exist in the candidates, choose the best English tutorial.
+4. If ALL candidates are irrelevant, off-topic, or low quality, return selectedCandidateId: -1.
+
+Respond ONLY with a valid JSON object in this exact format:
+{
+  "selectedCandidateId": <integer: 1-based ID from the candidate list, or -1 if all are off-topic>,
+  "reason": "1 sentence explanation of why this video was chosen and verified"
+}`
+
+  try {
+    const content = await createChatCompletion(
+      [{ role: 'user', content: prompt }],
+      { temperature: 0.1, maxTokens: 400 }
+    )
+    const parsed = extractJson<{ selectedCandidateId?: number; reason?: string }>(content)
+    if (typeof parsed.selectedCandidateId === 'number') {
+      if (parsed.selectedCandidateId >= 1 && parsed.selectedCandidateId <= candidates.length) {
+        return {
+          selectedIndex: parsed.selectedCandidateId - 1,
+          reason: parsed.reason || 'Verified as relevant tutorial',
+        }
+      }
+      if (parsed.selectedCandidateId === -1) {
+        return {
+          selectedIndex: -1,
+          reason: parsed.reason || 'All candidates were off-topic or irrelevant',
+        }
+      }
+    }
+  } catch (err) {
+    console.error('verifyAndSelectBestVideo error:', err)
+  }
+
+  return null
+}
+
 
 
 export async function streamChatWithMentor(
